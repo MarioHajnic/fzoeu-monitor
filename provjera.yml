@@ -1,0 +1,199 @@
+name: FZOEU provjera
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fzoeu
+  cancel-in-progress: false
+
+jobs:
+  provjera:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalacija
+        run: pip install requests beautifulsoup4
+
+      - name: Provjera stranice
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          cat > fzoeu_monitor.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """
+          FZOEU monitor: javlja kad se otvori javni poziv za kupnju novih vozila
+          na alternativna goriva (https://www.fzoeu.hr/hr/nacionalni-javni-pozivi-i-natjecaji/1367).
+
+          Instalacija:   pip install requests beautifulsoup4
+          Test parsiranja:  python fzoeu_monitor.py --test
+          Pokretanje (petlja svakih 30 min):  python fzoeu_monitor.py
+          Jednokratno (za cron / Task Scheduler):  python fzoeu_monitor.py --jednom
+
+          Obavijesti (postavi varijable okoline, dovoljna je jedna):
+            NTFY_TOPIC=tvoj-tajni-naziv        -> push na mobitel preko aplikacije ntfy (bez računa)
+            TELEGRAM_TOKEN + TELEGRAM_CHAT_ID  -> Telegram bot
+          Ako nije postavljeno ništa, obavijest se samo ispisuje u konzolu.
+          """
+          import argparse
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from datetime import datetime
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          URL = "https://www.fzoeu.hr/hr/nacionalni-javni-pozivi-i-natjecaji/1367"
+          STATE_FILE = Path(__file__).with_name("fzoeu_state.json")
+          STATUSI = {"otvoren", "zatvoren", "privremeno zatvoren"}
+          # Koji pozivi nas zanimaju (regex po naslovu). Može se promijeniti varijablom FZOEU_UZORAK.
+          UZORAK = re.compile(os.getenv("FZOEU_UZORAK", r"kupnj\w*\s+novih\s+vozila"), re.I)
+          HEADERS = {"User-Agent": "Mozilla/5.0 (FZOEU-monitor; osobna uporaba)"}
+
+
+          def log(msg):
+              print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
+
+          def dohvati_html():
+              r = requests.get(URL, headers=HEADERS, timeout=30)
+              r.raise_for_status()
+              r.encoding = "utf-8"
+              return r.text
+
+
+          def parsiraj(html):
+              """Vraća listu poziva: {status, naslov, datum}. Oslanja se na tekst stranice:
+              redak sa statusom -> redak s naslovom -> 'Otvoren: dd.mm.yyyy'."""
+              soup = BeautifulSoup(html, "html.parser")
+              linije = [l.strip() for l in soup.get_text("\n").splitlines() if l.strip()]
+              pozivi = []
+              for i, l in enumerate(linije):
+                  if l.lower() not in STATUSI or i + 1 >= len(linije):
+                      continue
+                  naslov = linije[i + 1]
+                  # datum je često u zasebnom (podebljanom) elementu, pa spajamo nekoliko redaka
+                  prozor = " ".join(linije[i + 2:i + 5])
+                  m = re.search(r"Otvoren:\s*(\d{2}\.\d{2}\.\d{4})", prozor)
+                  datum = m.group(1) if m else None
+                  if datum:  # odbacuje checkbox-ove iz filtera ("Otvoreni", "Privremeno zatvoren"...)
+                      pozivi.append({"status": l.lower(), "naslov": naslov, "datum": datum})
+              return pozivi
+
+
+          def posalji(poruka):
+              log("OBAVIJEST: " + poruka.replace("\n", " | "))
+              topic = os.getenv("NTFY_TOPIC")
+              if topic:
+                  try:
+                      requests.post(f"https://ntfy.sh/{topic}", data=poruka.encode("utf-8"),
+                                    headers={"Title": "FZOEU poziv", "Priority": "high"}, timeout=20)
+                  except requests.RequestException as e:
+                      log(f"ntfy greška: {e}")
+              token, chat = os.getenv("TELEGRAM_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+              if token and chat:
+                  try:
+                      requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                                    data={"chat_id": chat, "text": poruka}, timeout=20)
+                  except requests.RequestException as e:
+                      log(f"Telegram greška: {e}")
+
+
+          def ucitaj_stanje():
+              if STATE_FILE.exists():
+                  return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+              return {"statusi": {}, "prazno_javljeno": False}
+
+
+          def spremi_stanje(s):
+              STATE_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+          def provjeri(stalno=False):
+              stanje = ucitaj_stanje()
+              prvi_put = not stanje["statusi"]
+              pozivi = parsiraj(dohvati_html())
+
+              if not pozivi:
+                  if not stanje.get("prazno_javljeno"):
+                      posalji("FZOEU monitor: na stranici nisam našao nijedan poziv. "
+                              "Moguće je da se promijenila struktura stranice - provjeri skriptu.")
+                      stanje["prazno_javljeno"] = True
+                      spremi_stanje(stanje)
+                  return
+              stanje["prazno_javljeno"] = False
+
+              trazeni = [p for p in pozivi if UZORAK.search(p["naslov"])]
+              if not trazeni:
+                  log("Nijedan poziv ne odgovara uzorku.")
+
+              for p in trazeni:
+                  stari = stanje["statusi"].get(p["naslov"])
+                  novi = p["status"]
+                  stanje["statusi"][p["naslov"]] = novi
+                  opis = f'{p["naslov"]}\nStatus: {novi.upper()} (objavljen {p["datum"]})\n{URL}'
+                  if novi == "otvoren" and stari != "otvoren":
+                      posalji("🟢 OTVOREN POZIV!\n" + opis)
+                  elif stari is None:
+                      posalji("ℹ️ Praćenje pokrenuto / novi poziv.\n" + opis)
+                  elif stari != novi:
+                      posalji("Promjena statusa.\n" + opis)
+                  elif stalno:
+                      posalji("Status bez promjene.\n" + opis)
+                  else:
+                      log(f"Bez promjene: {p['naslov']} -> {novi}")
+
+              spremi_stanje(stanje)
+
+
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument("--jednom", action="store_true", help="provjeri jednom i izađi (za cron)")
+              ap.add_argument("--test", action="store_true", help="samo ispiši što je parsirano")
+              ap.add_argument("--stalno", action="store_true", help="javi status pri svakoj provjeri")
+              ap.add_argument("--interval", type=int, default=1800, help="sekunde između provjera (zadano 1800)")
+              a = ap.parse_args()
+
+              if a.test:
+                  for p in parsiraj(dohvati_html()):
+                      oznaka = "  <-- PRATI SE" if UZORAK.search(p["naslov"]) else ""
+                      print(f'{p["status"]:20} {p["datum"]}  {p["naslov"][:90]}{oznaka}')
+                  return
+
+              while True:
+                  try:
+                      provjeri(a.stalno)
+                  except Exception as e:  # mrežne i ostale greške ne smiju srušiti petlju
+                      log(f"Greška: {e}")
+                  if a.jednom:
+                      break
+                  time.sleep(a.interval)
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PYEOF
+          python fzoeu_monitor.py --jednom
+
+      - name: Spremi stanje
+        run: |
+          if [ -f fzoeu_state.json ]; then
+            git config user.name "fzoeu-bot"
+            git config user.email "fzoeu-bot@users.noreply.github.com"
+            git add fzoeu_state.json
+            git diff --cached --quiet || (git commit -m "Azurirano stanje" && git push)
+          fi
